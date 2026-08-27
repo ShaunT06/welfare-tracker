@@ -1,5 +1,6 @@
 const express = require('express');
 const { db, ready } = require('../db');
+const { fetchNormalizedRationCards } = require('../connectors/rationCardConnector');
 
 const router = express.Router();
 
@@ -8,7 +9,8 @@ async function getApplicationByTrackingId(trackingId) {
     sql: `SELECT applications.id, applications.tracking_id, applications.current_stage,
                  applications.created_at, applications.updated_at,
                  schemes.name AS scheme_name,
-                 applicants.name AS applicant_name
+                 applicants.name AS applicant_name,
+                 applicants.phone AS applicant_phone
           FROM applications
           JOIN schemes ON schemes.id = applications.scheme_id
           JOIN applicants ON applicants.id = applications.applicant_id
@@ -40,6 +42,29 @@ async function trackHandler(req, res) {
   const documents = documentsResult.rows;
   const missingDocuments = documents.filter((d) => d.status === 'missing');
 
+  // Show data from connected external systems too - but ONLY if the
+  // citizen has actually approved sharing it. This is what makes the
+  // citizen's own tracking page the single unified view the PS asks
+  // for, not just the officer dashboard's.
+  const consentResult = await db.execute({
+    sql: `SELECT status FROM consent_requests WHERE application_id = ? ORDER BY requested_at DESC LIMIT 1`,
+    args: [application.id],
+  });
+  const consentStatus = consentResult.rows[0]?.status || 'none';
+
+  let connectedSystems = [];
+  if (consentStatus === 'approved') {
+    const externalRecords = await fetchNormalizedRationCards();
+    const matched = externalRecords.filter((r) => r.phone === application.applicant_phone);
+    connectedSystems = matched.map((r) => ({
+      sourceSystem: r.source_system,
+      trackingId: r.tracking_id,
+      scheme: r.scheme_name,
+      currentStage: r.current_stage,
+      lastUpdated: r.created_at,
+    }));
+  }
+
   res.json({
     data: {
       trackingId: application.tracking_id,
@@ -50,6 +75,8 @@ async function trackHandler(req, res) {
       lastUpdatedAt: application.updated_at,
       timeline: timelineResult.rows,
       documents,
+      connectedSystems,
+      pendingConsentRequest: consentStatus === 'pending',
       actionRequired:
         missingDocuments.length > 0
           ? `Missing document(s): ${missingDocuments.map((d) => d.doc_name).join(', ')}. Please submit at your earliest convenience.`
@@ -84,8 +111,8 @@ router.get('/notifications/:trackingId', notificationsHandler);
 // GET /api/v1/applications/:trackingId/consent-requests
 // Citizen-facing: shows any PENDING requests from connected external
 // systems (e.g. Ration Card System) asking to share their data into
-// this application. This is the missing "citizen in the loop" step -
-// nothing gets shared until the citizen responds via the endpoint below.
+// this application. This is the "citizen in the loop" step - nothing
+// gets shared until the citizen responds via the endpoint below.
 router.get('/:trackingId/consent-requests', async (req, res) => {
   const { trackingId } = req.params;
   await ready;
